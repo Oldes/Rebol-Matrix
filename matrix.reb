@@ -3,7 +3,7 @@ REBOL [
     Type:    module
 	Name:    matrix
 	Date:    06-May-2023
-	Version: 0.1.0
+	Version: 0.1.1
 	Author:  @Oldes
 	Home:    https://github.com/Oldes/Rebol-Matrix
 	Rights:  http://opensource.org/licenses/Apache-2.0
@@ -73,27 +73,82 @@ sys/make-scheme [
                     'room set room [ref! | string! | lit-word! | word!] 
                     |     set room  ref!
                 ] (
+                    ;; Set the current room for use with other commands
                 	room: poke port 'room :room
                 )
                 | [
                     'send copy value some string!
                     |     copy value some string!
                 ] (
+                    ;; Send one or more plain text messages to the current room
                     forall value [send-message port value/1]
                 )
                 | 'invite set user [ref! | string!] set value opt string! (
+                    ;; This API invites a user to participate in a particular room. They do not start
+                    ;; participating in the room until they actually join the room.
+                    ;;
+                    ;; Only users currently in a particular room can invite other users to join that room.
                     send-invite port :user :value
                 )
                 | 'join set room [ref! | string! | lit-word! | word!] set value opt string! (
+                    ;; This API starts a user participating in a particular room, if that user is
+                    ;; allowed to participate in that room. After this call, the client is allowed to
+                    ;; see all current state events in the room, and all subsequent events associated
+                    ;; with the room until the user leaves the room.
                     room: poke port 'room :room
                     POST port [%join/ room] object [reason: any [value ""]]
                 )
                 | 'leave set room [ref! | string! | lit-word! | word!] set value opt string! (
-                    room: poke port 'room :room
-                    POST port [%rooms/ room %/leave] object [reason: any [value ""]]
+                    ;; This API stops a user participating in a particular room.
+                    ;; 
+                    ;; If the user was already in the room, they will no longer be able to see new
+                    ;; events in the room. If the room requires an invite to join, they will need to
+                    ;; be re-invited before they can re-join.
+                    ;; 
+                    ;; If the user was invited to the room, but had not joined, this call serves to
+                    ;; reject the invite.
+                    ;; 
+                    ;; The user will still be allowed to retrieve history from the room which they
+                    ;; were previously allowed to see.
+                    also
+                        POST port [%rooms/ get-id port/state/room-ids :room %/leave] object [reason: any [value ""]]
+                        port/state/room-id: room: none
+                )
+                | 'forget set room [ref! | string! | lit-word! | word!] (
+                    ;; This API stops a user remembering about a particular room.
+                    ;; 
+                    ;; In general, history is a first class citizen in Matrix. After this API is called,
+                    ;; however, a user will no longer be able to retrieve history for this room. If all
+                    ;; users on a homeserver forget a room, the room is eligible for deletion from that homeserver.
+                    ;; 
+                    ;; If the user is currently joined to the room, they must leave the room before calling this API.
+                    also 
+                        POST port [%rooms/ get-id port/state/room-ids :room %/forget]
+                        port/state/room-id: room: none
                 )
                 | 'kick set user string! set value opt string! (
+                    ;; Kick a user from the room.
+                    ;;
+                    ;; The caller must have the required power level in order to perform this operation.
                     membership/set port room :user 'leave :value
+                )
+                | 'ban set user string! set value opt string! (
+                    ;; A user may decide to ban another user in a room. ‘Banning’ forces the target
+                    ;; user to leave the room and prevents them from re-joining the room. A banned
+                    ;; user will not be treated as a joined user, and so will not be able to send or
+                    ;; receive events in the room. In order to ban someone, the user performing the
+                    ;; ban MUST have the required power level.
+                    membership/set port room :user 'ban :value
+                )
+                | 'unban set user string! set value opt string! (
+                    ;; Unban a user from the room. This allows them to be invited to the room,
+                    ;; and join if they would otherwise be allowed to join according to its join rules.
+                    ;;
+                    ;; The caller must have the required power level in order to perform this operation.
+                    POST port [%rooms/ room %/unban][
+                        user_id: get-id port/state/user-ids :user
+                        reason: any [value ""]
+                    ]
                 )
                 | skip ;; error?
             ]]
@@ -131,11 +186,7 @@ sys/make-scheme [
                     PUT port [%profile/ port/state/user-id %/displayname] object [displayname: :value]
                 ]
                 room [
-                    port/state/room-id: any [
-                        select port/state/room-ids :value
-                        attempt [select port/state/room-ids to word! :value]
-                        :value
-                    ]
+                    port/state/room-id: get-id port/state/room-ids :value
                 ]
             ]
         ]
@@ -187,9 +238,10 @@ sys/make-scheme [
     ]
 
     membership: func[port room user /set state message][
-        room: any [room port/state/room-id]
-        user: any [user port/state/user-id]
-        unless room: port/state/room-id [ log-error 'no-room exit ]
+        room: any [get-id port/state/room-ids room  port/state/room-id]
+        user: any [get-id port/state/user-ids user  port/state/user-id]
+        unless room  [ log-error 'no-room exit ]
+        unless user  [ log-error 'no-user exit ]
         either state [
             PUT port [%rooms/ room %/state/m.room.member/ user] object [
                 membership: state
@@ -215,8 +267,17 @@ sys/make-scheme [
     log-error: func[id][ sys/log/error 'MATRIX any [select errors id form id] ]
     errors: #(
         no-room:           "Missing room!"
+        no-user:           "Missing user!"
         no-room-to-send:   "Failed to send a message, because no room is specified!"
         no-room-to-invite: "Failed to send an invite, because no room is specified!"
     )
     counter: 0
+
+    get-id: func[ids value][
+		any [
+            select ids :value
+            attempt [select ids to word! :value]
+            :value
+        ]
+    ]
 ]
