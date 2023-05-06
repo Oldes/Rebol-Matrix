@@ -96,7 +96,7 @@ sys/make-scheme [
                     ;; see all current state events in the room, and all subsequent events associated
                     ;; with the room until the user leaves the room.
                     room: poke port 'room :room
-                    POST port [%join/ room] object [reason: any [value ""]]
+                    POST port [%join/ room] [reason: any [value ""]]
                 )
                 | 'leave set room [ref! | string! | lit-word! | word!] set value opt string! (
                     ;; This API stops a user participating in a particular room.
@@ -111,7 +111,7 @@ sys/make-scheme [
                     ;; The user will still be allowed to retrieve history from the room which they
                     ;; were previously allowed to see.
                     also
-                        POST port [%rooms/ get-id port/state/room-ids :room %/leave] object [reason: any [value ""]]
+                        POST port [%rooms/ get-id port/state/room-ids :room %/leave] [reason: any [value ""]]
                         port/state/room-id: room: none
                 )
                 | 'forget set room [ref! | string! | lit-word! | word!] (
@@ -183,7 +183,7 @@ sys/make-scheme [
         poke: func[port key value][
             switch key [
                 displayname  [
-                    PUT port [%profile/ port/state/user-id %/displayname] object [displayname: :value]
+                    PUT port [%profile/ port/state/user-id %/displayname] [displayname: :value]
                 ]
                 room [
                     port/state/room-id: get-id port/state/room-ids :value
@@ -202,7 +202,10 @@ sys/make-scheme [
     request: func[port method path data /local ctx res][
         ctx: port/state
         if block? path [path: rejoin path]
-        unless string? data [data: encode 'json data]
+        unless string? data [
+            if block? data [data: make object! data] ;; required for correct JSON result
+            data: encode 'json data
+        ]
         unless ctx/header [
         	;; reusing the same header
             ctx/header: compose [
@@ -224,14 +227,14 @@ sys/make-scheme [
 
     send-message: func[port message /local room][
         unless room: port/state/room-id [ log-error 'no-room-to-send exit ]        
-        PUT port rejoin [%rooms/ room %/send/m.room.message/ transaction-id] object [
+        PUT port rejoin [%rooms/ room %/send/m.room.message/ transaction-id] [
             msgtype:  "m.text"
             body: message
         ]
     ]
     send-invite: func[port user message][
         unless room: port/state/room-id [ log-error 'no-room-to-invite exit ]
-        POST port rejoin [%rooms/ room %/invite] object [
+        POST port rejoin [%rooms/ room %/invite] [
             user_id: any [port/state/user-ids/:user user]
             reason:  any [message ""]
         ]
@@ -243,7 +246,7 @@ sys/make-scheme [
         unless room  [ log-error 'no-room exit ]
         unless user  [ log-error 'no-user exit ]
         either state [
-            PUT port [%rooms/ room %/state/m.room.member/ user] object [
+            PUT port [%rooms/ room %/state/m.room.member/ user] [
                 membership: state
                 reason: any [message ""]
             ]
