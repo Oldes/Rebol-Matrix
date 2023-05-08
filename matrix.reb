@@ -2,8 +2,8 @@ REBOL [
     Title: "Matrix scheme"
     Type:    module
 	Name:    matrix
-	Date:    06-May-2023
-	Version: 0.1.1
+	Date:    08-May-2023
+	Version: 0.2.0
 	Author:  @Oldes
 	Home:    https://github.com/Oldes/Rebol-Matrix
 	Rights:  http://opensource.org/licenses/Apache-2.0
@@ -14,7 +14,7 @@ REBOL [
 
 
 ;system/options/log/http: 0  ;; turn off all HTTP traces
-system/options/log/matrix: 1 ;; basic matrix traces
+;system/options/log/matrix: 1 ;; basic matrix traces
 sys/log/info 'MATRIX "Initialize matrix scheme."
 
 sys/make-scheme [
@@ -41,6 +41,8 @@ sys/make-scheme [
                 timestamp:
                 next-batch:
                 user-name:
+                rooms:      ;; holds information about joined rooms collected by calls to sync
+                callbacks?:
             ] spec
 
             state/homeserver: host
@@ -54,6 +56,9 @@ sys/make-scheme [
 
             state/room-ids: any [state/room-ids #()]
             state/user-ids: any [state/user-ids #()]
+            state/rooms:    #()
+            state/timestamp: any [state/timestamp 0]
+            state/callbacks?: any [state/callbacks? true]
  
             ;; do not keep initial specs.. just the normalised ref
             port/spec: make system/standard/port-spec-head [
@@ -62,6 +67,11 @@ sys/make-scheme [
                 ref: rejoin [matrix:// any [select host 'host "matrix.org"]]
             ]
             port/state: state
+
+            if function? select spec 'on-message [port/actor/on-message: :spec/on-message]
+            if function? select spec 'on-room-event [port/actor/on-room-event: :spec/on-room-event]
+
+
             ;; if user-id is not directly provided, resolve it from the access token
             unless state/user-id [ pick port 'whoami ]
             port
@@ -82,6 +92,12 @@ sys/make-scheme [
                 ] (
                     ;; Send one or more plain text messages to the current room
                     forall value [send-message port value/1]
+                )
+                | 'marker set room string! set value string! (
+                    ;; Sets the position of the read marker for a given room,
+                    ;; and optionally the read receipt’s location.
+                    ;; (only room-id is expected!)
+                    send-read-markers port room value
                 )
                 | 'invite set user [ref! | string!] set value opt string! (
                     ;; This API invites a user to participate in a particular room. They do not start
@@ -171,12 +187,15 @@ sys/make-scheme [
                 room [
                     port/state/room-id ;; current room used in commands
                 ]
+                room-state [
+                    GET port [%rooms/ port/state/room-id %/state/ key]
+                ]
                 joined-rooms [
                     select GET port %joined_rooms 'joined_rooms
                 ]
                 membership [
                     membership port none none
-                ]  
+                ]
             ]]
         ]
         put:
@@ -192,10 +211,46 @@ sys/make-scheme [
         ]
         update: func[port /local data][
             data: GET port either port/state/next-batch [
-                append copy %sync?since= next-batch
+                append copy %sync?since= port/state/next-batch
             ][              %sync]
+            if port/state/callbacks? [process port data]
             port/state/next-batch: data/next_batch
             data
+        ]
+
+        on-message: func[port event][]
+        on-room-event: func[port room event /local value key membership][
+            value: switch event/type [
+                "m.room.message"         [
+                    port/actor/on-message port event
+                    event/content/body
+                ]
+                "m.room.member"          [
+                    key: event/state_key
+                    switch membership: event/content/membership [
+                        "join"  [ room/memebers/:key: event/content/displayname ]
+                        "leave" [ remove/key room/memebers :key ]
+                    ]
+                    sys/log/more 'MATRIX [as-yellow event/type membership as-green key]
+                    return event
+                ]
+                "m.room.topic"           [room/topic:        event/content/topic]
+                "m.room.name"            [room/name:         event/content/name]
+                "m.room.avatar"          [room/avatar:       event/content/url]
+                "m.room.canonical_alias" [room/alias:        event/content/alias]
+                "m.room.guest_access"    [room/guest_access: event/content/guest_access]
+                "m.room.join_rules"      [room/join_rules:   event/content/join_rules]
+                ;"m.room.history_visibility"
+                ;"m.room.create"
+                ;"m.room.power_levels"
+                ;"m.space.parent"
+            ]
+            either value [
+                sys/log/more  'MATRIX [as-yellow event/type as-green value]
+            ][
+                sys/log/debug 'MATRIX [as-yellow event/type "ignored"]
+            ]
+            event
         ]
     ]
 
@@ -239,6 +294,15 @@ sys/make-scheme [
             reason:  any [message ""]
         ]
     ]
+    send-read-markers: func[port room event][
+        ;; Sets the position of the read marker for a given room,
+        ;; and optionally the read receipt’s location.
+        POST port [%rooms/ room %/read_markers] [
+            ;m.fully_read: id ;; deprecated since v1.4
+            m.read:
+            m.read.private: event
+        ]
+    ]
 
     membership: func[port room user /set state message][
         room: any [get-id port/state/room-ids room  port/state/room-id]
@@ -253,6 +317,40 @@ sys/make-scheme [
         ][
             GET port [%rooms/ room %/state/m.room.member/ user]
         ]
+    ]
+
+    process: func[port data /local ts ts-max ts-prev id prev-room][
+        if any [none? data/rooms none? data/rooms/join][return none]
+        prev-room: port/state/room-id
+        ts-prev: ts-max: port/state/timestamp
+        ts: 0
+        foreach [room-id data] data/rooms/join [
+            port/state/room-id: room-id
+            id: none
+            info: select port/state/rooms :room-id
+            unless info [
+                port/state/rooms/:room-id: info: to map! make object! [
+                    name: topic: avatar: none
+                    memebers: make map! 8
+                ]
+            ]
+            if function? :port/actor/on-room-event [
+                foreach e data/state/events [ port/actor/on-room-event port info e ]
+            ]
+
+            sys/log/info 'MATRIX ["Processing messages in room:" as-green room-id "(" info/name ")"]
+            foreach e data/timeline/events [
+                ts: e/origin_server_ts
+                id: e/event_id
+                ;; evaluate event callbacks only if it is newer than already processed
+                if ts > ts-prev [ port/actor/on-room-event port info e ]
+            ]
+            if id [ send-read-markers port room-id id ]
+            ts-max: max ts ts-max
+        ]
+        ;?? port/state/rooms
+        port/state/room-id: prev-room
+        port/state/timestamp: ts-max
     ]
 
 ;    precise-timestamp: func[/local n s][
